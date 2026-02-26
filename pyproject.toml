@@ -1,0 +1,18 @@
+[project]
+name = "skw-yolo"
+version = "0.1.0"
+description = "YOLO26 object detection and U-Net segmentation for skeleton weed in drone imagery"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastai>=2.8.7",
+    "jupyter>=1.1.1",
+    "rasterio>=1.5.0",
+    "timm>=1.0.25",
+    "tqdm>=4.67.3",
+    "ultralytics>=8.4.16",
+    "safetensors>=0.4.0",
+    "fastprogress==1.0.2",
+    "ruff>=0.15.2",
+    "segmentation-models-pytorch>=0.5.0",
+]
