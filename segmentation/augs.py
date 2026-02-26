@@ -19,6 +19,15 @@ class MosaicSegCallback(Callback):
         self.min_center = min_center
         self.max_center = max_center
 
+    def _mosaic_2d(self, t, perm1, perm2, perm3, cy, cx, H, W):
+        """Apply mosaic slicing to a [B, H, W] tensor."""
+        out = torch.empty_like(t)
+        out[:, :cy, :cx] = t[:, H - cy :, W - cx :]
+        out[:, :cy, cx:] = t[perm1, H - cy :, : W - cx]
+        out[:, cy:, :cx] = t[perm2, : H - cy, W - cx :]
+        out[:, cy:, cx:] = t[perm3, : H - cy, : W - cx]
+        return out
+
     def before_batch(self):
         if not self.training or random.random() > self.p:
             return
@@ -42,15 +51,19 @@ class MosaicSegCallback(Callback):
         mos_img[:, :, cy:, :cx] = images[perm2, :, : H - cy, W - cx :]
         mos_img[:, :, cy:, cx:] = images[perm3, :, : H - cy, : W - cx]
 
-        # Mosaic masks (same slicing, no channel dim)
-        mos_mask = torch.empty_like(masks)
-        mos_mask[:, :cy, :cx] = masks[:, H - cy :, W - cx :]
-        mos_mask[:, :cy, cx:] = masks[perm1, H - cy :, : W - cx]
-        mos_mask[:, cy:, :cx] = masks[perm2, : H - cy, W - cx :]
-        mos_mask[:, cy:, cx:] = masks[perm3, : H - cy, : W - cx]
+        # Mosaic masks and weight maps (same slicing, no channel dim)
+        mos_mask = self._mosaic_2d(masks, perm1, perm2, perm3, cy, cx, H, W)
+
+        yb = (mos_mask,)
+        if len(self.learn.yb) > 1:
+            weight_maps = self.learn.yb[1]
+            mos_weights = self._mosaic_2d(
+                weight_maps, perm1, perm2, perm3, cy, cx, H, W
+            )
+            yb = (mos_mask, mos_weights)
 
         self.learn.xb = (TensorImage(mos_img),)
-        self.learn.yb = (mos_mask,)
+        self.learn.yb = yb
 
 
 class GeometricSegAugCallback(Callback):
@@ -68,19 +81,29 @@ class GeometricSegAugCallback(Callback):
 
         images = self.learn.xb[0]
         masks = self.learn.yb[0]
+        weight_maps = self.learn.yb[1] if len(self.learn.yb) > 1 else None
 
         if random.random() < self.flip_p:
             images = torch.flip(images, dims=[-1])
             masks = torch.flip(masks, dims=[-1])
+            if weight_maps is not None:
+                weight_maps = torch.flip(weight_maps, dims=[-1])
 
         if random.random() < self.flip_p:
             images = torch.flip(images, dims=[-2])
             masks = torch.flip(masks, dims=[-2])
+            if weight_maps is not None:
+                weight_maps = torch.flip(weight_maps, dims=[-2])
 
         if random.random() < self.rot90_p:
             k = random.choice([1, 2, 3])
             images = torch.rot90(images, k, dims=[-2, -1])
             masks = torch.rot90(masks, k, dims=[-2, -1])
+            if weight_maps is not None:
+                weight_maps = torch.rot90(weight_maps, k, dims=[-2, -1])
 
         self.learn.xb = (TensorImage(images),)
-        self.learn.yb = (masks,)
+        yb = (masks,) if weight_maps is None else (masks, weight_maps)
+        self.learn.yb = yb
+
+

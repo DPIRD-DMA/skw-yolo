@@ -4,11 +4,11 @@ import torch
 import torch.nn.functional as F
 
 
-class DiceCELoss:
-    """Combined Dice + CE loss for binary segmentation.
+class DiceCenterWeightedCELoss:
+    """Combined Dice + center-weighted CE loss for binary segmentation.
 
-    Dice focuses on foreground overlap (handles class imbalance).
-    CE provides stable pixel-level gradients.
+    CE is weighted per-pixel using a center weight map (high at bbox centers,
+    fading to 1.0 at edges). Dice focuses on foreground overlap.
 
     Args:
         dice_weight: Multiplier for the Dice loss term.
@@ -31,14 +31,20 @@ class DiceCELoss:
             else None
         )
 
-    def __call__(self, pred, targ):
+    def __call__(self, pred, targ, pixel_weights=None):
         targ = targ.long()
 
-        # Cross-entropy (with optional class weights)
+        # Cross-entropy (with optional class weights + spatial pixel weights)
         w = self.class_weights
         if w is not None:
             w = w.to(pred.device)
-        ce = F.cross_entropy(pred, targ, weight=w)
+
+        if pixel_weights is not None:
+            # Per-pixel weighted CE: compute unreduced, multiply by spatial weights, then mean
+            ce_unreduced = F.cross_entropy(pred, targ, weight=w, reduction="none")
+            ce = (ce_unreduced * pixel_weights.to(pred.device)).mean()
+        else:
+            ce = F.cross_entropy(pred, targ, weight=w)
 
         # Dice (foreground class only)
         pred_fg = F.softmax(pred, dim=1)[:, 1]  # [B, H, W]
