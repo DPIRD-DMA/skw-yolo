@@ -210,3 +210,4 @@ models/*
 yolo26*.pt
 segmentation/models/*
 seg2/models/*
+*/models/*.pth
