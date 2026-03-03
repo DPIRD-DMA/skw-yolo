@@ -15,7 +15,9 @@ def _get_erosion_kernel(device: torch.device) -> torch.Tensor:
     return _EROSION_KERNEL
 
 
-def _erode_distance(region: torch.Tensor, clip_distance: int, kernel: torch.Tensor) -> torch.Tensor:
+def _erode_distance(
+    region: torch.Tensor, clip_distance: int, kernel: torch.Tensor
+) -> torch.Tensor:
     """Compute erosion-based distance field for a binary region [B, 1, H, W].
 
     Returns distance map [B, H, W] with values in [0, clip_distance].
@@ -79,23 +81,29 @@ def center_distance_weights(
 
         if direction == "center":
             # boundary=1.0, interior=max_w
-            weights[cls_mask] = 1.0 + (dist_map[cls_mask] / clip_distance) * (max_w - 1.0)
+            weights[cls_mask] = 1.0 + (dist_map[cls_mask] / clip_distance) * (
+                max_w - 1.0
+            )
         else:  # "edge"
             # boundary=max_w, interior=1.0
-            weights[cls_mask] = max_w - (dist_map[cls_mask] / clip_distance) * (max_w - 1.0)
+            weights[cls_mask] = max_w - (dist_map[cls_mask] / clip_distance) * (
+                max_w - 1.0
+            )
 
     return weights
 
 
 class DiceCELoss:
-    """Combined Dice + center-weighted CE loss for binary segmentation.
+    """Combined Dice + center-weighted CE + centroid heatmap loss.
 
-    Center-distance weighting is computed from the mask inside the loss
-    function (no weight maps needed in the data pipeline).
+    Predictions: [B, 3, H, W] — channels 0-1 are seg logits, channel 2 is centroid logits.
+    Targets: [B, 2, H, W] — channel 0 is seg mask (float), channel 1 is centroid heatmap.
 
     Args:
         dice_weight: Multiplier for the Dice loss term.
         ce_weight: Multiplier for the CE loss term.
+        centroid_weight: Multiplier for the centroid heatmap loss term.
+        centroid_pos_weight: Extra weight on positive centroid pixels to combat sparsity.
         class_weights: Optional per-class weights for CE (e.g. [1.0, 10.0]).
         clip_distance: Erosion depth for center-distance weighting.
         class_ramps: Per-class spatial weighting. Dict mapping class_id to
@@ -108,6 +116,8 @@ class DiceCELoss:
         self,
         dice_weight: float = 10.0,
         ce_weight: float = 1.0,
+        centroid_weight: float = 1.0,
+        centroid_pos_weight: float = 50.0,
         class_weights: list[float] | None = None,
         clip_distance: int = 3,
         class_ramps: dict[int, tuple[float, str]] | None = None,
@@ -115,6 +125,8 @@ class DiceCELoss:
     ):
         self.dice_weight = dice_weight
         self.ce_weight = ce_weight
+        self.centroid_weight = centroid_weight
+        self.centroid_pos_weight = centroid_pos_weight
         self.class_weights = (
             torch.tensor(class_weights, dtype=torch.float32)
             if class_weights is not None
@@ -125,31 +137,38 @@ class DiceCELoss:
         self.ignore_index = ignore_index
 
     def __call__(self, pred, targ):
-        targ = targ.long()
+        # Split multi-channel target: [B, 2, H, W] → seg mask + centroid heatmap
+        seg_mask = targ[:, 0].long()
+        centroid_target = targ[:, 1]
 
-        # Compute center-distance pixel weights from mask
+        # Split predictions: [B, 3, H, W] → seg logits + centroid logits
+        seg_logits = pred[:, :2]
+        centroid_logits = pred[:, 2]
+
+        # --- Segmentation loss (unchanged) ---
         with torch.no_grad():
             pixel_weights = center_distance_weights(
-                targ, self.clip_distance, self.class_ramps, self.ignore_index
+                seg_mask, self.clip_distance, self.class_ramps, self.ignore_index
             )
 
-        # Cross-entropy with class weights and spatial pixel weights
         w = self.class_weights
         if w is not None:
             w = w.to(pred.device)
 
         ce_unreduced = F.cross_entropy(
-            pred, targ, weight=w, reduction="none",
+            seg_logits,
+            seg_mask,
+            weight=w,
+            reduction="none",
             ignore_index=self.ignore_index if self.ignore_index is not None else -100,
         )
         ce = (ce_unreduced * pixel_weights).mean()
 
-        # Dice (foreground class only, excluding ignore pixels)
-        pred_fg = F.softmax(pred, dim=1)[:, 1]  # [B, H, W]
-        targ_fg = (targ == 1).float()
+        pred_fg = F.softmax(seg_logits, dim=1)[:, 1]  # [B, H, W]
+        targ_fg = (seg_mask == 1).float()
 
         if self.ignore_index is not None:
-            valid = targ != self.ignore_index
+            valid = seg_mask != self.ignore_index
             pred_fg = pred_fg[valid]
             targ_fg = targ_fg[valid]
 
@@ -157,4 +176,23 @@ class DiceCELoss:
         union = pred_fg.sum() + targ_fg.sum()
         dice = (2 * inter + 1) / (union + 1)
 
-        return self.ce_weight * ce + self.dice_weight * (1 - dice)
+        seg_loss = self.ce_weight * ce + self.dice_weight * (1 - dice)
+
+        # --- Centroid heatmap loss (weighted MSE) ---
+        centroid_pred = torch.sigmoid(centroid_logits)
+
+        # Mask out padding regions
+        if self.ignore_index is not None:
+            valid_cent = seg_mask != self.ignore_index
+            centroid_pred = centroid_pred[valid_cent]
+            centroid_target = centroid_target[valid_cent]
+
+        # Weighted MSE: positive pixels get extra weight
+        per_pixel_weight = torch.where(
+            centroid_target > 0.5, self.centroid_pos_weight, 1.0
+        )
+        centroid_loss = (
+            per_pixel_weight * (centroid_pred - centroid_target) ** 2
+        ).mean()
+
+        return seg_loss + self.centroid_weight * centroid_loss

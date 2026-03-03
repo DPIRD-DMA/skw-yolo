@@ -21,7 +21,9 @@ from shared.data import load_labels, parse_splits
 _crop_state = threading.local()
 
 
-def rasterize_boxes(bboxes: torch.Tensor, img_size: int, shape: str = "box") -> torch.Tensor:
+def rasterize_boxes(
+    bboxes: torch.Tensor, img_size: int, shape: str = "box"
+) -> torch.Tensor:
     """Convert normalized xywh boxes to a binary mask [H, W].
 
     Args:
@@ -52,10 +54,58 @@ def rasterize_boxes(bboxes: torch.Tensor, img_size: int, shape: str = "box") -> 
         y1 = ((bboxes[:, 1] - bboxes[:, 3] / 2) * img_size).clamp(0, img_size).int()
         x2 = ((bboxes[:, 0] + bboxes[:, 2] / 2) * img_size).clamp(0, img_size).int()
         y2 = ((bboxes[:, 1] + bboxes[:, 3] / 2) * img_size).clamp(0, img_size).int()
-        in_y = (rows.unsqueeze(0) >= y1.unsqueeze(1)) & (rows.unsqueeze(0) < y2.unsqueeze(1))
-        in_x = (cols.unsqueeze(0) >= x1.unsqueeze(1)) & (cols.unsqueeze(0) < x2.unsqueeze(1))
+        in_y = (rows.unsqueeze(0) >= y1.unsqueeze(1)) & (
+            rows.unsqueeze(0) < y2.unsqueeze(1)
+        )
+        in_x = (cols.unsqueeze(0) >= x1.unsqueeze(1)) & (
+            cols.unsqueeze(0) < x2.unsqueeze(1)
+        )
         mask = (in_y.unsqueeze(2) & in_x.unsqueeze(1)).any(dim=0).long()
     return mask
+
+
+def rasterize_centroids(
+    bboxes: torch.Tensor, img_size: int, sigma: float = 3.0
+) -> torch.Tensor:
+    """Convert normalized xywh box centers to a Gaussian centroid heatmap [H, W].
+
+    Args:
+        bboxes: [N, 4] normalized xywh bounding boxes.
+        img_size: Output heatmap size (square).
+        sigma: Gaussian standard deviation in pixels.
+
+    Returns:
+        Float32 heatmap [H, W] with values in [0, 1].
+    """
+    heatmap = torch.zeros(img_size, img_size, dtype=torch.float32)
+    if len(bboxes) == 0:
+        return heatmap
+
+    radius = int(3 * sigma + 0.5)  # 3-sigma window
+
+    for i in range(len(bboxes)):
+        cx = int(bboxes[i, 0].item() * img_size)
+        cy = int(bboxes[i, 1].item() * img_size)
+
+        # Clamp window to image bounds
+        y0 = max(0, cy - radius)
+        y1 = min(img_size, cy + radius + 1)
+        x0 = max(0, cx - radius)
+        x1 = min(img_size, cx + radius + 1)
+        if y0 >= y1 or x0 >= x1:
+            continue
+
+        # Local Gaussian
+        yy = torch.arange(y0, y1, dtype=torch.float32) - cy
+        xx = torch.arange(x0, x1, dtype=torch.float32) - cx
+        gy = torch.exp(-(yy**2) / (2 * sigma**2))
+        gx = torch.exp(-(xx**2) / (2 * sigma**2))
+        gaussian = gy.unsqueeze(1) * gx.unsqueeze(0)  # [h, w]
+
+        # Max-merge to keep values in [0, 1]
+        heatmap[y0:y1, x0:x1] = torch.max(heatmap[y0:y1, x0:x1], gaussian)
+
+    return heatmap
 
 
 def open_img(img_path: Path, canvas_size: int) -> TensorImage:
@@ -80,7 +130,9 @@ def open_img(img_path: Path, canvas_size: int) -> TensorImage:
         _crop_state.mode = "crop"
         _crop_state.crop_top = crop_top
         _crop_state.crop_left = crop_left
-        img = img[:, crop_top : crop_top + canvas_size, crop_left : crop_left + canvas_size]
+        img = img[
+            :, crop_top : crop_top + canvas_size, crop_left : crop_left + canvas_size
+        ]
         return TensorImage(img)
 
     if h == canvas_size and w == canvas_size:
@@ -98,12 +150,20 @@ def open_img(img_path: Path, canvas_size: int) -> TensorImage:
     return TensorImage(canvas)
 
 
-def open_mask(label_path: Path, canvas_size: int, ignore_index: int, shape: str = "box") -> TensorMask:
-    """Load YOLO labels, rasterize at native resolution, place on canvas.
+def open_mask(
+    label_path: Path,
+    canvas_size: int,
+    ignore_index: int,
+    shape: str = "box",
+    centroid_sigma: float = 3.0,
+) -> TensorMask:
+    """Load YOLO labels, rasterize seg mask + centroid heatmap, place on canvas.
 
-    Mask is rasterized at the image's native size, then cropped or padded
-    to match the same placement used for the image. Padding regions are
-    filled with ignore_index.
+    Returns a [2, H, W] float tensor:
+      - Channel 0: seg mask (0.0, 1.0, or ignore_index as float)
+      - Channel 1: centroid Gaussian heatmap (0.0 to 1.0)
+
+    Padding regions: seg channel filled with ignore_index, centroid channel with 0.
     """
     _, bboxes = load_labels(label_path)
 
@@ -112,26 +172,29 @@ def open_mask(label_path: Path, canvas_size: int, ignore_index: int, shape: str 
 
     # Rasterize at native image size (use min dimension for square assumption)
     native_size = min(h, w)
-    mask = rasterize_boxes(bboxes, native_size, shape=shape)
+    mask = rasterize_boxes(bboxes, native_size, shape=shape).float()
+    centroids = rasterize_centroids(bboxes, native_size, sigma=centroid_sigma)
 
     if _crop_state.mode == "crop":
-        # Random crop — same region as image
         ct = _crop_state.crop_top
         cl = _crop_state.crop_left
         mask = mask[ct : ct + canvas_size, cl : cl + canvas_size]
-        return TensorMask(mask)
+        centroids = centroids[ct : ct + canvas_size, cl : cl + canvas_size]
+        return TensorMask(torch.stack([mask, centroids], dim=0))
 
     if _crop_state.mode == "exact":
-        return TensorMask(mask)
+        return TensorMask(torch.stack([mask, centroids], dim=0))
 
-    # Pad mode — place on ignore-filled canvas at same offset as image
+    # Pad mode — seg channel gets ignore_index fill, centroid channel gets 0
     top = _crop_state.top
     left = _crop_state.left
-    canvas = torch.full(
-        (canvas_size, canvas_size), fill_value=ignore_index, dtype=mask.dtype
+    seg_canvas = torch.full(
+        (canvas_size, canvas_size), fill_value=float(ignore_index), dtype=torch.float32
     )
-    canvas[top : top + h, left : left + w] = mask
-    return TensorMask(canvas)
+    seg_canvas[top : top + h, left : left + w] = mask
+    cent_canvas = torch.zeros(canvas_size, canvas_size, dtype=torch.float32)
+    cent_canvas[top : top + h, left : left + w] = centroids
+    return TensorMask(torch.stack([seg_canvas, cent_canvas], dim=0))
 
 
 def label_func(img_path: Path, data_dir: Path) -> Path:
@@ -147,11 +210,13 @@ def build_dataloaders(
     batch_tfms: list | None = None,
     num_workers: int = 0,
     shape: str = "box",
+    centroid_sigma: float = 3.0,
 ) -> DataLoaders:
     """Build fastai DataLoaders using DataBlock for SKW segmentation.
 
     Images are loaded at native resolution and placed at random offsets on a
     canvas_size x canvas_size tensor. Mask padding is filled with ignore_index.
+    Target is a [2, H, W] float tensor: channel 0 = seg mask, channel 1 = centroid heatmap.
     """
     split_map = parse_splits(data_dir)
     images_dir = data_dir / "images"
@@ -167,7 +232,13 @@ def build_dataloaders(
         return split_map.get(img_path.stem) == "val"
 
     open_img_func = partial(open_img, canvas_size=canvas_size)
-    open_mask_func = partial(open_mask, canvas_size=canvas_size, ignore_index=ignore_index, shape=shape)
+    open_mask_func = partial(
+        open_mask,
+        canvas_size=canvas_size,
+        ignore_index=ignore_index,
+        shape=shape,
+        centroid_sigma=centroid_sigma,
+    )
     label_func_bound = partial(label_func, data_dir=data_dir)
 
     dblock = DataBlock(
