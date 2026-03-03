@@ -29,13 +29,15 @@ class UnetWithCentroids(nn.Module):
         # Decoder output channels (input to segmentation_head)
         decoder_out_ch = self.unet.segmentation_head[0].in_channels
 
-        # Deeper centroid head with dilated convolutions for larger receptive
-        # field — lets the head "look across" objects to find centers rather
-        # than just reflecting edge features from the decoder.
+        # Centroid head with BatchNorm + large dilated convolutions.
+        # Dilations 8+16 give ~50px receptive field so the head can
+        # discriminate center-of-object vs edge-of-object features.
         self.centroid_head = nn.Sequential(
-            nn.Conv2d(decoder_out_ch, 64, kernel_size=3, padding=2, dilation=2),
+            nn.Conv2d(decoder_out_ch, 64, kernel_size=3, padding=8, dilation=8),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 32, kernel_size=3, padding=4, dilation=4),
+            nn.Conv2d(64, 32, kernel_size=3, padding=16, dilation=16),
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 1, kernel_size=1),
         )

@@ -93,6 +93,47 @@ def center_distance_weights(
     return weights
 
 
+def centernet_focal_loss(
+    pred_logits: torch.Tensor,
+    target: torch.Tensor,
+    alpha: float = 2.0,
+    beta: float = 4.0,
+) -> torch.Tensor:
+    """CenterNet / CornerNet focal loss for heatmap regression.
+
+    Naturally handles extreme class imbalance (sparse positive pixels) by
+    down-weighting easy negatives via the (1-y)^beta term.
+
+    Args:
+        pred_logits: Raw logits (pre-sigmoid). Flat tensor after masking.
+        target: Gaussian heatmap targets in [0, 1]. Same shape as pred_logits.
+        alpha: Focusing exponent on misclassified pixels.
+        beta: Penalty reduction for negatives near positive centers.
+
+    Returns:
+        Scalar loss normalized by number of positive peaks.
+    """
+    pred = torch.sigmoid(pred_logits)
+    pred = pred.clamp(1e-6, 1 - 1e-6)
+
+    pos_mask = target == 1.0
+    neg_mask = ~pos_mask
+
+    # Positive loss: -(1-p)^alpha * log(p)
+    pos_loss = -(1 - pred[pos_mask]).pow(alpha) * pred[pos_mask].log()
+
+    # Negative loss: -(1-y)^beta * p^alpha * log(1-p)
+    neg_loss = (
+        -(1 - target[neg_mask]).pow(beta)
+        * pred[neg_mask].pow(alpha)
+        * (1 - pred[neg_mask]).log()
+    )
+
+    # Normalize by number of positive peaks (not pixels)
+    n_pos = pos_mask.float().sum().clamp(min=1)
+    return (pos_loss.sum() + neg_loss.sum()) / n_pos
+
+
 class DiceCELoss:
     """Combined Dice + center-weighted CE + centroid heatmap loss.
 
@@ -103,7 +144,6 @@ class DiceCELoss:
         dice_weight: Multiplier for the Dice loss term.
         ce_weight: Multiplier for the CE loss term.
         centroid_weight: Multiplier for the centroid heatmap loss term.
-        centroid_pos_weight: Extra weight on positive centroid pixels to combat sparsity.
         class_weights: Optional per-class weights for CE (e.g. [1.0, 10.0]).
         clip_distance: Erosion depth for center-distance weighting.
         class_ramps: Per-class spatial weighting. Dict mapping class_id to
@@ -117,7 +157,7 @@ class DiceCELoss:
         dice_weight: float = 10.0,
         ce_weight: float = 1.0,
         centroid_weight: float = 1.0,
-        centroid_pos_weight: float = 50.0,
+        centroid_pos_weight: float = 20.0,
         class_weights: list[float] | None = None,
         clip_distance: int = 3,
         class_ramps: dict[int, tuple[float, str]] | None = None,
@@ -145,7 +185,7 @@ class DiceCELoss:
         seg_logits = pred[:, :2]
         centroid_logits = pred[:, 2]
 
-        # --- Segmentation loss (unchanged) ---
+        # --- Segmentation loss ---
         with torch.no_grad():
             pixel_weights = center_distance_weights(
                 seg_mask, self.clip_distance, self.class_ramps, self.ignore_index
@@ -178,21 +218,19 @@ class DiceCELoss:
 
         seg_loss = self.ce_weight * ce + self.dice_weight * (1 - dice)
 
-        # --- Centroid heatmap loss (weighted MSE) ---
-        centroid_pred = torch.sigmoid(centroid_logits)
-
-        # Mask out padding regions
+        # --- Centroid heatmap loss (BCE with pos_weight) ---
         if self.ignore_index is not None:
             valid_cent = seg_mask != self.ignore_index
-            centroid_pred = centroid_pred[valid_cent]
-            centroid_target = centroid_target[valid_cent]
+            cent_logits_flat = centroid_logits[valid_cent]
+            cent_target_flat = centroid_target[valid_cent]
+        else:
+            cent_logits_flat = centroid_logits.flatten()
+            cent_target_flat = centroid_target.flatten()
 
-        # Weighted MSE: positive pixels get extra weight
-        per_pixel_weight = torch.where(
-            centroid_target > 0.5, self.centroid_pos_weight, 1.0
+        # Per-pixel weight: positive (>0.5) pixels get extra weight
+        pw = torch.where(cent_target_flat > 0.5, self.centroid_pos_weight, 1.0)
+        centroid_loss = F.binary_cross_entropy_with_logits(
+            cent_logits_flat, cent_target_flat, weight=pw
         )
-        centroid_loss = (
-            per_pixel_weight * (centroid_pred - centroid_target) ** 2
-        ).mean()
 
         return seg_loss + self.centroid_weight * centroid_loss

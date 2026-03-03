@@ -97,13 +97,16 @@ class CentroidCountMAE(Metric):
     def accumulate(self, learn):
         centroid_pred = torch.sigmoid(learn.pred[:, 2])  # [B, H, W]
         centroid_target = learn.yb[0][:, 1]  # [B, H, W]
+        seg_pred = learn.pred[:, :2].argmax(dim=1)  # [B, H, W]
 
         for i in range(centroid_pred.shape[0]):
             gt_count = _count_peaks(
                 centroid_target[i], threshold=0.5, nms_kernel=self.nms_kernel
             )
+            # Mask centroid preds to predicted foreground to filter bg false positives
+            masked_pred = centroid_pred[i] * seg_pred[i].float()
             pred_count = _count_peaks(
-                centroid_pred[i], threshold=self.threshold, nms_kernel=self.nms_kernel
+                masked_pred, threshold=self.threshold, nms_kernel=self.nms_kernel
             )
 
             self.total_ae += abs(pred_count - gt_count)
@@ -112,6 +115,57 @@ class CentroidCountMAE(Metric):
     @property
     def value(self):
         return self.total_ae / self.n if self.n > 0 else 0.0
+
+
+class CentroidCountMAPE(Metric):
+    """Mean absolute percentage error between predicted and GT centroid counts.
+
+    Per-image: |pred - gt| / max(gt, 1). Images with gt=0 and pred=0 score 0%;
+    images with gt=0 and pred>0 score 100%. Robust to "predict nothing" exploits
+    unlike MAE, since missing all objects in an image = 100% error.
+    """
+
+    def __init__(self, threshold: float = 0.3, nms_kernel: int = 41):
+        self.threshold = threshold
+        self.nms_kernel = nms_kernel
+        self.reset()
+
+    @property
+    def name(self):
+        return "cnt_mape"
+
+    def reset(self):
+        self.total_ape = 0.0
+        self.n = 0
+
+    def accumulate(self, learn):
+        centroid_pred = torch.sigmoid(learn.pred[:, 2])  # [B, H, W]
+        centroid_target = learn.yb[0][:, 1]  # [B, H, W]
+        seg_pred = learn.pred[:, :2].argmax(dim=1)  # [B, H, W]
+
+        for i in range(centroid_pred.shape[0]):
+            gt_count = _count_peaks(
+                centroid_target[i], threshold=0.5, nms_kernel=self.nms_kernel
+            )
+            # Mask centroid preds to predicted foreground to filter bg false positives
+            masked_pred = centroid_pred[i] * seg_pred[i].float()
+            pred_count = _count_peaks(
+                masked_pred, threshold=self.threshold, nms_kernel=self.nms_kernel
+            )
+
+            if gt_count == 0 and pred_count == 0:
+                ape = 0.0
+            elif gt_count == 0:
+                ape = 1.0  # 100% error for false positives on empty image
+            else:
+                ape = abs(pred_count - gt_count) / gt_count
+
+            self.total_ape += ape
+            self.n += 1
+
+    @property
+    def value(self):
+        return self.total_ape / self.n if self.n > 0 else 0.0
 
 
 def _count_peaks(heatmap: torch.Tensor, threshold: float = 0.3, nms_kernel: int = 41) -> int:
