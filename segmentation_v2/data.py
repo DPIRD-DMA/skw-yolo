@@ -3,7 +3,6 @@
 import random
 import sys
 import threading
-from functools import partial
 from pathlib import Path
 
 import torch
@@ -250,12 +249,45 @@ def _has_labels(label_path: Path) -> bool:
     return bool(label_path.read_text().strip())
 
 
+class _SplitAwareImg:
+    """Open image using train or val canvas size based on split membership."""
+
+    def __init__(self, train_cs: int, val_cs: int, val_paths: frozenset[str]):
+        self.train_cs = train_cs
+        self.val_cs = val_cs
+        self.val_paths = val_paths
+
+    def __call__(self, img_path: Path) -> TensorImage:
+        cs = self.val_cs if str(img_path) in self.val_paths else self.train_cs
+        _crop_state.canvas_size = cs
+        return open_img(img_path, cs)
+
+
+class _SplitAwareMask:
+    """Open mask using canvas size stored by _SplitAwareImg in thread-local state."""
+
+    def __init__(
+        self, default_cs: int, ignore_index: int, shape: str, centroid_sigma: float
+    ):
+        self.default_cs = default_cs
+        self.ignore_index = ignore_index
+        self.shape = shape
+        self.centroid_sigma = centroid_sigma
+
+    def __call__(self, label_path: Path) -> TensorMask:
+        cs = getattr(_crop_state, "canvas_size", self.default_cs)
+        return open_mask(
+            label_path, cs, self.ignore_index, self.shape, self.centroid_sigma
+        )
+
+
 def build_dataloaders(
     data_dir: Path,
     data_v2_dir: Path | None = None,
     positive_oversample: int = 1,
     exclude_stems: set[str] | None = None,
     canvas_size: int = 1000,
+    val_canvas_size: int | None = None,
     ignore_index: int = 99,
     train_bs: int = 6,
     val_bs: int | None = None,
@@ -337,9 +369,12 @@ def build_dataloaders(
             print(f"val_pct={val_pct}: using {n_keep}/{all_val} val images")
         all_items = train_items + val_items
 
+    val_cs = val_canvas_size if val_canvas_size is not None else canvas_size
+
     # Build lookup dicts keyed by image path string
     label_lookup = {str(img): lbl for img, lbl, _ in all_items}
     val_lookup = {str(img): is_val for img, _, is_val in all_items}
+    val_paths = frozenset(str(img) for img, _, is_v in all_items if is_v)
 
     def get_items(source):
         return [img for img, _, _ in all_items]
@@ -350,14 +385,8 @@ def build_dataloaders(
     def get_label(img_path):
         return label_lookup[str(img_path)]
 
-    open_img_func = partial(open_img, canvas_size=canvas_size)
-    open_mask_func = partial(
-        open_mask,
-        canvas_size=canvas_size,
-        ignore_index=ignore_index,
-        shape=shape,
-        centroid_sigma=centroid_sigma,
-    )
+    open_img_func = _SplitAwareImg(canvas_size, val_cs, val_paths)
+    open_mask_func = _SplitAwareMask(canvas_size, ignore_index, shape, centroid_sigma)
 
     dblock = DataBlock(
         blocks=[
