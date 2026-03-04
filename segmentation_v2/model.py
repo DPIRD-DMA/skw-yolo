@@ -30,8 +30,8 @@ class UnetWithCentroids(nn.Module):
         decoder_out_ch = self.unet.segmentation_head[0].in_channels
 
         # Centroid head with BatchNorm + large dilated convolutions.
-        # Dilations 8+16 give ~50px receptive field so the head can
-        # discriminate center-of-object vs edge-of-object features.
+        # Dilations 8+16+32 give ~115px receptive field matching
+        # median object diameter so the head can see the full object.
         self.centroid_head = nn.Sequential(
             nn.Conv2d(decoder_out_ch, 64, kernel_size=3, padding=8, dilation=8),
             nn.BatchNorm2d(64),
@@ -39,7 +39,10 @@ class UnetWithCentroids(nn.Module):
             nn.Conv2d(64, 32, kernel_size=3, padding=16, dilation=16),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 1, kernel_size=1),
+            nn.Conv2d(32, 16, kernel_size=3, padding=32, dilation=32),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=1),
         )
         # CenterNet-style bias init: sigmoid(-4) ≈ 0.018, so initial
         # predictions are near-zero ("assume background") instead of 0.5.

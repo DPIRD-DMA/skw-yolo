@@ -74,12 +74,31 @@ class ForegroundIoU(JaccardCoeffMulti):
             self.union[c] = c_union
 
 
-class CentroidCountMAE(Metric):
-    """Mean absolute error between predicted and ground-truth centroid counts.
+def _per_image_counts(learn, threshold: float, nms_kernel: int):
+    """Extract per-image (gt_count, pred_count) pairs from a batch.
 
-    Counts GT centroids by thresholding heatmap peaks (>0.5).
-    Counts predicted centroids via 3x3 local-max detection above a threshold.
+    Shared logic for centroid counting metrics. Masks predictions to
+    predicted foreground to filter background false positives.
     """
+    centroid_pred = torch.sigmoid(learn.pred[:, 2])  # [B, H, W]
+    centroid_target = learn.yb[0][:, 1]  # [B, H, W]
+    seg_pred = learn.pred[:, :2].argmax(dim=1)  # [B, H, W]
+
+    counts = []
+    for i in range(centroid_pred.shape[0]):
+        gt_count = _count_peaks(
+            centroid_target[i], threshold=0.5, nms_kernel=nms_kernel
+        )
+        masked_pred = centroid_pred[i] * seg_pred[i].float()
+        pred_count = _count_peaks(
+            masked_pred, threshold=threshold, nms_kernel=nms_kernel
+        )
+        counts.append((gt_count, pred_count))
+    return counts
+
+
+class CentroidCountMAE(Metric):
+    """Mean absolute error between predicted and ground-truth centroid counts."""
 
     def __init__(self, threshold: float = 0.3, nms_kernel: int = 41):
         self.threshold = threshold
@@ -95,20 +114,9 @@ class CentroidCountMAE(Metric):
         self.n = 0
 
     def accumulate(self, learn):
-        centroid_pred = torch.sigmoid(learn.pred[:, 2])  # [B, H, W]
-        centroid_target = learn.yb[0][:, 1]  # [B, H, W]
-        seg_pred = learn.pred[:, :2].argmax(dim=1)  # [B, H, W]
-
-        for i in range(centroid_pred.shape[0]):
-            gt_count = _count_peaks(
-                centroid_target[i], threshold=0.5, nms_kernel=self.nms_kernel
-            )
-            # Mask centroid preds to predicted foreground to filter bg false positives
-            masked_pred = centroid_pred[i] * seg_pred[i].float()
-            pred_count = _count_peaks(
-                masked_pred, threshold=self.threshold, nms_kernel=self.nms_kernel
-            )
-
+        for gt_count, pred_count in _per_image_counts(
+            learn, self.threshold, self.nms_kernel
+        ):
             self.total_ae += abs(pred_count - gt_count)
             self.n += 1
 
@@ -139,20 +147,9 @@ class CentroidCountMAPE(Metric):
         self.n = 0
 
     def accumulate(self, learn):
-        centroid_pred = torch.sigmoid(learn.pred[:, 2])  # [B, H, W]
-        centroid_target = learn.yb[0][:, 1]  # [B, H, W]
-        seg_pred = learn.pred[:, :2].argmax(dim=1)  # [B, H, W]
-
-        for i in range(centroid_pred.shape[0]):
-            gt_count = _count_peaks(
-                centroid_target[i], threshold=0.5, nms_kernel=self.nms_kernel
-            )
-            # Mask centroid preds to predicted foreground to filter bg false positives
-            masked_pred = centroid_pred[i] * seg_pred[i].float()
-            pred_count = _count_peaks(
-                masked_pred, threshold=self.threshold, nms_kernel=self.nms_kernel
-            )
-
+        for gt_count, pred_count in _per_image_counts(
+            learn, self.threshold, self.nms_kernel
+        ):
             if gt_count == 0 and pred_count == 0:
                 ape = 0.0
             elif gt_count == 0:
@@ -168,17 +165,39 @@ class CentroidCountMAPE(Metric):
         return self.total_ape / self.n if self.n > 0 else 0.0
 
 
-def _count_peaks(heatmap: torch.Tensor, threshold: float = 0.3, nms_kernel: int = 41) -> int:
+def _gaussian_blur(tensor: torch.Tensor, sigma: float = 3.0) -> torch.Tensor:
+    """Apply Gaussian blur to a [1, 1, H, W] tensor for noise suppression."""
+    ks = int(6 * sigma + 1) | 1  # kernel size, ensure odd
+    ax = torch.arange(-ks // 2 + 1.0, ks // 2 + 1.0, device=tensor.device)
+    kernel = torch.exp(-0.5 * (ax / sigma) ** 2)
+    kernel = kernel / kernel.sum()
+    kernel_2d = kernel.unsqueeze(0) * kernel.unsqueeze(1)  # [ks, ks]
+    kernel_2d = kernel_2d.unsqueeze(0).unsqueeze(0)  # [1, 1, ks, ks]
+    pad = ks // 2
+    return F.conv2d(tensor, kernel_2d, padding=pad)
+
+
+def _count_peaks(
+    heatmap: torch.Tensor,
+    threshold: float = 0.3,
+    nms_kernel: int = 41,
+    smooth_sigma: float = 2.0,
+) -> int:
     """Count local maxima in a 2D heatmap above a threshold.
 
     Uses max-pooling NMS: a pixel is a peak only if it equals the local
     maximum within the nms_kernel window AND exceeds threshold.
-    nms_kernel should be scaled to the Gaussian sigma (e.g. 2*sigma+1).
+    Applies Gaussian blur first to suppress noise and merge nearby peaks.
     """
     # Ensure odd kernel for symmetric padding
     nms_kernel = nms_kernel if nms_kernel % 2 == 1 else nms_kernel + 1
     pad = nms_kernel // 2
     h = heatmap.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+
+    # Smooth to suppress noise before peak detection
+    if smooth_sigma > 0:
+        h = _gaussian_blur(h, smooth_sigma)
+
     local_max = F.max_pool2d(h, kernel_size=nms_kernel, stride=1, padding=pad)
     is_peak = (h == local_max) & (h > threshold)
     return int(is_peak.sum().item())

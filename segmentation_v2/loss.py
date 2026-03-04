@@ -93,47 +93,6 @@ def center_distance_weights(
     return weights
 
 
-def centernet_focal_loss(
-    pred_logits: torch.Tensor,
-    target: torch.Tensor,
-    alpha: float = 2.0,
-    beta: float = 4.0,
-) -> torch.Tensor:
-    """CenterNet / CornerNet focal loss for heatmap regression.
-
-    Naturally handles extreme class imbalance (sparse positive pixels) by
-    down-weighting easy negatives via the (1-y)^beta term.
-
-    Args:
-        pred_logits: Raw logits (pre-sigmoid). Flat tensor after masking.
-        target: Gaussian heatmap targets in [0, 1]. Same shape as pred_logits.
-        alpha: Focusing exponent on misclassified pixels.
-        beta: Penalty reduction for negatives near positive centers.
-
-    Returns:
-        Scalar loss normalized by number of positive peaks.
-    """
-    pred = torch.sigmoid(pred_logits)
-    pred = pred.clamp(1e-6, 1 - 1e-6)
-
-    pos_mask = target == 1.0
-    neg_mask = ~pos_mask
-
-    # Positive loss: -(1-p)^alpha * log(p)
-    pos_loss = -(1 - pred[pos_mask]).pow(alpha) * pred[pos_mask].log()
-
-    # Negative loss: -(1-y)^beta * p^alpha * log(1-p)
-    neg_loss = (
-        -(1 - target[neg_mask]).pow(beta)
-        * pred[neg_mask].pow(alpha)
-        * (1 - pred[neg_mask]).log()
-    )
-
-    # Normalize by number of positive peaks (not pixels)
-    n_pos = pos_mask.float().sum().clamp(min=1)
-    return (pos_loss.sum() + neg_loss.sum()) / n_pos
-
-
 class DiceCELoss:
     """Combined Dice + center-weighted CE + centroid heatmap loss.
 

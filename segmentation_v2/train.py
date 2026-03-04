@@ -17,7 +17,7 @@ from data import build_dataloaders
 from model import UnetWithCentroids
 from loss import DiceCELoss
 from metrics import ForegroundIoU, SegDiceMulti, CentroidCountMAE, CentroidCountMAPE
-from augs import BatchFlip, BatchRot90
+from augs import BatchFlip, BatchRot90, BatchRotate
 from shared.helpers import print_system_info
 from shared.augs import RandomRectangle, RandomSharpenBlur, DynamicZScoreNormalize
 
@@ -30,7 +30,7 @@ canvas_size = 792
 ignore_index = 99
 batch_size = 6
 gradient_accumulation_batch_size = 16
-learning_rate = 2e-4
+learning_rate = 3e-4
 epoch_count = 10
 
 # Loss weights
@@ -47,7 +47,7 @@ centroid_sigma = 12.0
 centroid_weight = 1.0
 centroid_pos_weight = 10.0
 centroid_threshold = 0.3
-nms_kernel = 61  # ~half median object diameter; allows overlapping neighbors
+nms_kernel = 61  # ~half median object diameter
 
 
 def train():
@@ -61,8 +61,9 @@ def train():
     batch_tfms = [
         BatchFlip(),
         BatchRot90(),
+        BatchRotate(max_angle=15.0, ignore_index=ignore_index, p=0.3),
         DynamicZScoreNormalize(target_mean=0.0, target_std=1.0),
-        RandomRectangle(p=0.3, sl=0.5, sh=0.04, max_count=5),
+        RandomRectangle(p=0.2, sl=0.02, sh=0.1, max_count=3),
         RandomSharpenBlur(min_factor=0.5, max_factor=1.5),
     ]
 
@@ -70,7 +71,7 @@ def train():
         data_dir=data_dir,
         canvas_size=canvas_size,
         ignore_index=ignore_index,
-        bs=batch_size,
+        train_bs=batch_size,
         batch_tfms=batch_tfms,
         shape="ellipse",
         centroid_sigma=centroid_sigma,
