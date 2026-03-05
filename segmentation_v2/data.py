@@ -281,9 +281,40 @@ class _SplitAwareMask:
         )
 
 
+def _is_v2_dataset(data_dir: Path) -> bool:
+    """Detect v2 hierarchical layout (initial/tiled/ or extra/*/tiled/)."""
+    return (data_dir / "initial").exists() or (data_dir / "extra").exists()
+
+
+def _collect_items(
+    data_dir: Path, exclude_stems: set[str] | None = None,
+) -> list[tuple[Path, Path, bool]]:
+    """Collect (img_path, label_path, is_val) from either dataset format."""
+    seen_stems: set[str] = set(exclude_stems or ())
+    all_items: list[tuple[Path, Path, bool]] = []
+
+    if _is_v2_dataset(data_dir):
+        for img_path, label_path, split in collect_v2_items(data_dir):
+            if img_path.stem not in seen_stems:
+                all_items.append((img_path, label_path, split == "val"))
+                seen_stems.add(img_path.stem)
+    else:
+        split_map = parse_splits(data_dir)
+        images_dir = data_dir / "images"
+        if images_dir.exists():
+            for f in sorted(images_dir.iterdir()):
+                if f.suffix.lower() in {".jpg", ".jpeg", ".png"}:
+                    if f.stem in seen_stems:
+                        continue
+                    label_path = data_dir / "labels" / f"{f.stem}.txt"
+                    all_items.append((f, label_path, split_map.get(f.stem) == "val"))
+                    seen_stems.add(f.stem)
+
+    return all_items
+
+
 def build_dataloaders(
     data_dir: Path,
-    data_v2_dir: Path | None = None,
     positive_oversample: int = 1,
     exclude_stems: set[str] | None = None,
     canvas_size: int = 1000,
@@ -304,8 +335,9 @@ def build_dataloaders(
     canvas_size x canvas_size tensor. Mask padding is filled with ignore_index.
     Target is a [2, H, W] float tensor: channel 0 = seg mask, channel 1 = centroid heatmap.
 
-    When data_v2_dir is provided, also loads images from the hierarchical
-    initial/tiled/ + extra/*/tiled/ structure. Duplicates (by stem) are skipped.
+    Accepts either dataset format:
+      - Flat: data_dir/images/ + data_dir/labels/ + train.txt/val.txt
+      - V2 hierarchical: data_dir/initial/tiled/ + data_dir/extra/*/tiled/
 
     Args:
         positive_oversample: Repeat positive (has-object) train images this many
@@ -313,26 +345,7 @@ def build_dataloaders(
             different augmentations. E.g. 5 = positives appear 5x per epoch.
         exclude_stems: Set of image stems to skip (e.g. bad/corrupt images).
     """
-    all_items: list[tuple[Path, Path, bool]] = []  # (img_path, label_path, is_val)
-    seen_stems: set[str] = set(exclude_stems or ())
-
-    # Original flat dataset (data_dir/images/ + data_dir/labels/)
-    split_map = parse_splits(data_dir)
-    images_dir = data_dir / "images"
-    if images_dir.exists():
-        for f in sorted(images_dir.iterdir()):
-            if f.suffix.lower() in {".jpg", ".jpeg", ".png"}:
-                label_path = data_dir / "labels" / f"{f.stem}.txt"
-                _is_val = split_map.get(f.stem) == "val"
-                all_items.append((f, label_path, _is_val))
-                seen_stems.add(f.stem)
-
-    # data_v2 hierarchical dataset (skip stems already in original)
-    if data_v2_dir is not None:
-        for img_path, label_path, split in collect_v2_items(data_v2_dir):
-            if img_path.stem not in seen_stems:
-                all_items.append((img_path, label_path, split == "val"))
-                seen_stems.add(img_path.stem)
+    all_items = _collect_items(data_dir, exclude_stems)
 
     # Oversample positive train images to rebalance against negatives
     if positive_oversample > 1:
