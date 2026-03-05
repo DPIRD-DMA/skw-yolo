@@ -7,7 +7,6 @@ import torch
 from fastai.callback.schedule import fit_one_cycle  # noqa: F401 (patches Learner)
 from fastai.callback.tracker import SaveModelCallback
 from fastai.learner import Learner
-from fastai.callback.training import GradientAccumulation
 from fastai.vision.all import ShowGraphCallback
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -36,9 +35,8 @@ ignore_index = 99
 
 train_bs = 24
 val_bs = 8
-gradient_accumulation_batch_size = 24
 learning_rate = 3e-4
-epoch_count = 25
+epoch_count = 10
 num_workers = 8
 
 # Positive oversampling to rebalance against empty tiles
@@ -47,10 +45,10 @@ positive_oversample = 5
 # Loss weights
 dice_weight = 17.0
 ce_weight = 1.0
-clip_distance = 30
+clip_distance = 10  # reduced from 30 (fewer erosion iterations)
 class_ramps = {
-    1: (3.0, "edge"),   # boundary pixels weighted 3x for sharper borders
-    0: (2.0, "center"),
+    1: (3.0, "edge"),   # boundary pixels weighted 3x — helps counting
+    # bg ramp removed — was not helping metrics
 }
 
 # Centroid config
@@ -110,8 +108,7 @@ def train():
 
     callbacks = [
         ShowGraphCallback(),
-        GradientAccumulation(gradient_accumulation_batch_size),
-        EMACallback(decay=0.99),  # fast convergence for ~80 batches/epoch
+        EMACallback(decay=0.99),
         SaveModelCallback(monitor="fg_iou", comp=lambda a, b: a > b),
     ]
 

@@ -146,23 +146,25 @@ class DiceCELoss:
         centroid_logits = pred[:, 2]
 
         # --- Segmentation loss ---
-        with torch.no_grad():
-            pixel_weights = center_distance_weights(
-                seg_mask, self.clip_distance, self.class_ramps, self.ignore_index
-            )
-
         w = self.class_weights
         if w is not None:
             w = w.to(pred.device)
 
-        ce_unreduced = F.cross_entropy(
-            seg_logits,
-            seg_mask,
-            weight=w,
-            reduction="none",
-            ignore_index=self.ignore_index if self.ignore_index is not None else -100,
-        )
-        ce = (ce_unreduced * pixel_weights).mean()
+        ignore = self.ignore_index if self.ignore_index is not None else -100
+
+        if self.clip_distance > 0 and self.class_ramps is not None:
+            with torch.no_grad():
+                pixel_weights = center_distance_weights(
+                    seg_mask, self.clip_distance, self.class_ramps, self.ignore_index
+                )
+            ce_unreduced = F.cross_entropy(
+                seg_logits, seg_mask, weight=w, reduction="none", ignore_index=ignore,
+            )
+            ce = (ce_unreduced * pixel_weights).mean()
+        else:
+            ce = F.cross_entropy(
+                seg_logits, seg_mask, weight=w, ignore_index=ignore,
+            )
 
         pred_fg = F.softmax(seg_logits, dim=1)[:, 1]  # [B, H, W]
         targ_fg = (seg_mask == 1).float()

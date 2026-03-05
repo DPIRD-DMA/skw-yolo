@@ -27,7 +27,9 @@ class UnetWithCentroids(nn.Module):
             classes=2,  # seg only: bg + fg
         )
         # Decoder output channels (input to segmentation_head)
-        decoder_out_ch = self.unet.segmentation_head[0].in_channels
+        seg_head_conv = self.unet.segmentation_head[0]
+        assert isinstance(seg_head_conv, nn.Conv2d)
+        decoder_out_ch = seg_head_conv.in_channels
 
         # Centroid head with BatchNorm + large dilated convolutions.
         # Dilations 8+16+32 give ~115px receptive field matching
@@ -46,7 +48,9 @@ class UnetWithCentroids(nn.Module):
         )
         # CenterNet-style bias init: sigmoid(-4) ≈ 0.018, so initial
         # predictions are near-zero ("assume background") instead of 0.5.
-        nn.init.constant_(self.centroid_head[-1].bias, -4.0)
+        final_conv = self.centroid_head[-1]
+        assert isinstance(final_conv, nn.Conv2d) and final_conv.bias is not None
+        nn.init.constant_(final_conv.bias, -4.0)
 
     def forward(self, x):
         features = self.unet.encoder(x)
