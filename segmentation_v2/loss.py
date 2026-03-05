@@ -1,7 +1,8 @@
-"""Loss functions for binary segmentation with center-distance weighting."""
+"""Loss functions and training callbacks for binary segmentation."""
 
 import torch
 import torch.nn.functional as F
+from fastai.callback.core import Callback
 
 # Cached erosion kernel
 _EROSION_KERNEL = None
@@ -186,10 +187,57 @@ class DiceCELoss:
             cent_logits_flat = centroid_logits.flatten()
             cent_target_flat = centroid_target.flatten()
 
-        # Per-pixel weight: positive (>0.5) pixels get extra weight
-        pw = torch.where(cent_target_flat > 0.5, self.centroid_pos_weight, 1.0)
+        # Continuous pos_weight proportional to target intensity:
+        # background (0) → 1.0, peak (1.0) → centroid_pos_weight, smooth in between
+        pw = 1.0 + cent_target_flat * (self.centroid_pos_weight - 1.0)
         centroid_loss = F.binary_cross_entropy_with_logits(
             cent_logits_flat, cent_target_flat, weight=pw
         )
 
         return seg_loss + self.centroid_weight * centroid_loss
+
+
+class EMACallback(Callback):
+    """Exponential Moving Average of model weights.
+
+    Maintains float32 shadow weights updated each training step.
+    Swaps in EMA weights for validation, reverts for training.
+    Replaces model with EMA version after training completes.
+    """
+
+    order = 65
+
+    def __init__(self, decay: float = 0.9999):
+        self.decay = decay
+
+    def before_fit(self):
+        self.ema_state = {
+            k: v.clone().float() for k, v in self.learn.model.state_dict().items()
+        }
+
+    def after_batch(self):
+        if self.training:
+            d = self.decay
+            with torch.no_grad():
+                for k, v in self.learn.model.state_dict().items():
+                    self.ema_state[k].mul_(d).add_(v.float(), alpha=1 - d)
+
+    def before_validate(self):
+        self._saved = {
+            k: v.clone() for k, v in self.learn.model.state_dict().items()
+        }
+        self.learn.model.load_state_dict(
+            {k: v.to(self._saved[k].dtype) for k, v in self.ema_state.items()}
+        )
+
+    def after_validate(self):
+        self.learn.model.load_state_dict(self._saved)
+        del self._saved
+
+    def after_fit(self):
+        self.learn.model.load_state_dict(
+            {
+                k: v.to(self.learn.model.state_dict()[k].dtype)
+                for k, v in self.ema_state.items()
+            }
+        )
