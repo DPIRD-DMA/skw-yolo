@@ -17,14 +17,24 @@ class UnetWithCentroids(nn.Module):
     """
 
     def __init__(
-        self, encoder_name: str, encoder_weights: str = "imagenet", in_channels: int = 3
+        self,
+        encoder_name: str,
+        encoder_weights: str = "imagenet",
+        in_channels: int = 3,
+        arch: str = "unet",
+        decoder_attention: str | None = None,
     ):
         super().__init__()
-        self.unet = smp.Unet(
+        arch_cls = {"unet": smp.Unet, "unetpp": smp.UnetPlusPlus}[arch]
+        kwargs = {}
+        if decoder_attention:
+            kwargs["decoder_attention_type"] = decoder_attention
+        self.unet = arch_cls(
             encoder_name=encoder_name,
             encoder_weights=encoder_weights,
             in_channels=in_channels,
             classes=2,  # seg only: bg + fg
+            **kwargs,
         )
         # Decoder output channels (input to segmentation_head)
         seg_head_conv = self.unet.segmentation_head[0]

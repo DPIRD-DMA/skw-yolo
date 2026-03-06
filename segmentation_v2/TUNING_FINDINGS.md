@@ -115,6 +115,7 @@ All experiments run for 10 epochs on RTX 4090, batch_size=6, grad_accum=16.
 ```python
 # Architecture
 model_type = "convnextv2_tiny.fcmae_ft_in22k_in1k"  # ConvNeXtV2 Tiny encoder
+# smp.Unet (plain, no attention — SCSE attention tested but hurt fg_iou)
 # 3-layer dilated centroid head: d=8,16,32 (~115px RF)
 # BatchNorm + ReLU between layers
 # CenterNet bias init (-4.0) on final conv
@@ -122,17 +123,20 @@ model_type = "convnextv2_tiny.fcmae_ft_in22k_in1k"  # ConvNeXtV2 Tiny encoder
 # Training
 canvas_size = 792
 batch_size = 6
-gradient_accumulation_batch_size = 16
+gradient_accumulation_batch_size = 24
 learning_rate = 3e-4  # with discriminative slice(lr/5, lr)
-epoch_count = 10
+epoch_count = 25  # peaks at ~12-13 epochs, SaveModelCallback saves best
+ema_decay = 0.995  # slower EMA for stable validation
 
 # Loss weights
-dice_weight = 10.0
+dice_weight = 15.0
 ce_weight = 1.0
-centroid_weight = 1.0
+lovasz_weight = 5.0  # Lovász-Softmax loss directly optimizes IoU
+focal_gamma = 1.0  # Focal CE: downweight easy pixels, focus on hard boundaries
+centroid_weight = 1.5
 centroid_pos_weight = 10.0
-clip_distance = 30
-class_ramps = {1: (5.0, "center"), 0: (2.0, "center")}
+clip_distance = 10
+class_ramps = {1: (3.0, "edge")}  # boundary pixel upweighting
 
 # Centroid config
 centroid_sigma = 12.0
@@ -140,20 +144,67 @@ centroid_threshold = 0.3
 nms_kernel = 61
 
 # Post-processing
-smooth_sigma = 3.0  # Gaussian blur before peak detection
+smooth_sigma = 2.0  # Gaussian blur before peak detection (in _count_peaks)
+
+# Augmentations
+# BatchResample(min_scale=0.5, max_scale=1.1) — critical for generalization
+# BatchFlip, BatchRot90, BatchRotate(15°, p=0.3)
+# DynamicZScoreNormalize, RandomRectangle, RandomSharpenBlur
+# RandomClipLargeImages(400-600) — after resample
 ```
 
-**Best results:** fg_iou=0.641, cnt_mae=1.78, cnt_mape=0.40
+**Best results (balanced):** fg_iou=0.651, cnt_mae=1.40, cnt_mape=0.31 (focal_gamma=1.0)
+**Best results (counting):** fg_iou=0.646, cnt_mae=0.87, cnt_mape=0.26 (focal_gamma=2.0)
 
 ## Key Takeaways
 
-1. **Gaussian smoothing in peak detection** was the single biggest improvement for counting accuracy (cnt_mape: 1.86 → 0.40)
-2. **3-layer dilated centroid head** (d=8,16,32) with BatchNorm gives better segmentation than 2-layer
-3. **Loss weight balance is critical** — centroid and segmentation losses compete for shared encoder capacity
-4. **ConvNeXtV2 Tiny** significantly outperforms Nano for this task
-5. **Discriminative LR** (lower for encoder, higher for heads) helps both tasks
-6. **NMS kernel must match object scale** (~half median diameter), not sigma
-7. **MAPE is more robust than MAE** for counting evaluation (MAE can be gamed by predicting nothing)
+1. **Lovász-Softmax loss** was the biggest improvement for fg_iou (+0.015 over Dice-only), directly optimizing IoU
+2. **Focal cross-entropy** (gamma=1.0) improves counting without hurting fg_iou; higher gamma (2.0) dramatically improves counting (cnt_mape: 0.34→0.26) but reduces fg_iou by ~0.005
+3. **Gaussian smoothing in peak detection** was the single biggest early improvement for counting (cnt_mape: 1.86 → 0.40)
+4. **Training at native 792px resolution** significantly outperforms 600px with cropping (fg_iou: 0.636 → 0.651)
+5. **3-layer dilated centroid head** (d=8,16,32) with BatchNorm gives better segmentation than 2-layer
+6. **Loss weight balance is critical** — centroid and segmentation losses compete for shared encoder capacity
+7. **centroid_weight=1.5** is the sweet spot; 2.0 steals too much from segmentation (fg_iou drops 0.003)
+8. **EMA decay=0.995** (slower) outperforms 0.99 (faster), giving more stable validation metrics
+9. **ConvNeXtV2 Tiny** significantly outperforms Nano for this task
+10. **Discriminative LR** (lower for encoder, higher for heads) helps both tasks
+11. **NMS kernel must match object scale** (~half median diameter), not sigma
+12. **MAPE is more robust than MAE** for counting evaluation (MAE can be gamed by predicting nothing)
+13. **BatchResample augmentation** is important for spatial resolution generalization even at full resolution
+
+### What Helped
+
+| Change | fg_iou Impact | cnt_mape Impact | Notes |
+|--------|---------------|-----------------|-------|
+| Lovász loss (weight=5) | +0.015 | — | Direct IoU optimization |
+| 792px training resolution | +0.010 | +0.05 | Match val resolution |
+| Focal CE (gamma=1.0) | +0.000 | +0.03 | Focus on hard pixels |
+| Focal CE (gamma=2.0) | -0.005 | +0.08 | Best counting, slight fg_iou cost |
+| centroid_weight=1.5 | — | +0.11 | Better counting focus |
+| EMA decay 0.995 | +0.005 | — | More stable validation |
+| dice_weight=15 (with Lovász) | +0.005 | — | Let Lovász handle IoU |
+
+### What Did Not Help
+
+| Change | fg_iou Impact | cnt_mape Impact | Notes |
+|--------|---------------|-----------------|-------|
+| SCSE decoder attention | -0.011 | — | Extra params don't help this task |
+| Weight decay 0.01 | -0.005 | +0.01 | Regularization hurts peak performance |
+| Stronger augmentations | -0.005 | +0.01 | Too aggressive for 434-image dataset |
+| dice_weight=17 (with Lovász=5) | -0.005 | — | Competes with Lovász; 15 is better |
+| centroid_weight=2.0 | -0.003 | +0.03 | Steals too much from segmentation |
+| Focal gamma=1.5 | -0.004 | — | Worse than both 1.0 and 2.0 |
+| ConvNeXtV2 Base encoder | OOM | — | Too large for 792px on RTX 4090 |
+| UNet++ decoder | crash | — | Incompatible with 792px (not div by 16) |
+
+### Focal Gamma Sweep
+
+| Gamma | fg_iou | cnt_mape | cnt_mae | Notes |
+|-------|--------|----------|---------|-------|
+| 0.0 | 0.651 | 0.337 | 1.47 | No focal (iter 3) |
+| 1.0 | **0.651** | 0.311 | 1.40 | Best balance |
+| 1.5 | 0.647 | 0.327 | 1.42 | Worse at both |
+| 2.0 | 0.646 | **0.258** | **0.87** | Best counting |
 
 ## Progression Summary
 
@@ -164,3 +215,7 @@ smooth_sigma = 3.0  # Gaussian blur before peak detection
 | + 3-layer dilated head | 0.642 | 1.86 | Larger receptive field |
 | + Weight rebalancing | 0.640 | 0.99 | dice=20, cw=2.0 |
 | + Gaussian smoothing | 0.641 | 0.40 | Post-processing noise filter |
+| + 792px + Lovász (w=3) | 0.642 | 0.33 | Full resolution + IoU loss |
+| + Lovász w=5 + EMA 0.995 | 0.651 | 0.34 | Stronger IoU optimization |
+| + Focal CE (gamma=1.0) | **0.651** | **0.31** | Focus on hard pixels |
+| (alt) Focal CE (gamma=2.0) | 0.646 | **0.26** | Best counting variant |
